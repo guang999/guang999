@@ -1,0 +1,630 @@
+// <!--GAMFC-->基于提交 43fad05dcdae3b723c53c226f8181fc5bd47223e 的版本，时间为 2023-06-22 15:20:02 UTC<!--GAMFC-END-->。
+// @ts-忽略
+从 'cloudflare:sockets' 导入 { connect };
+
+// 如何生成自己的UUID:
+// [Windows] 按“Win + R”，输入cmd并运行：Powershell -NoExit -Command "[guid]::NewGuid()"
+让用户ID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
+
+让代理IP = '';
+
+
+if (!isValidUUID(用户ID)) {
+	throw new Error('uuid 无效');
+}
+
+导出默认值{
+	/**
+	 * @param {import("@cloudflare/workers-types").Request} 请求
+	 * @param {{UUID: 字符串, PROXYIP: 字符串}} env
+	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
+	 * @returns {Promise<响应>}
+	 */
+	异步获取（请求，env，ctx）{
+		尝试 {
+			用户 ID = env.UUID || 用户身份;
+			proxyIP = env.PROXYIP || 代理服务器的IP;
+			const UpgradeHeader = request.headers.get('升级');
+			if (!upgradeHeader || UpgradeHeader !== 'websocket') {
+				const url = 新 URL(request.url);
+				switch (url.路径名) {
+					案件 '/'：
+						返回新的响应（JSON.stringify（request.cf），{状态：200}）；
+					case `/${userID}`: {
+						const vlessConfig = getVLESSConfig(userID, request.headers.get('Host'));
+						返回新的响应(`${vlessConfig}`, {
+							状态：200，
+							标题：{
+								"Content-Type": "text/plain;charset=utf-8",
+							}
+						});
+					}
+					默认：
+						return new Response('未找到', { status: 404 });
+				}
+			} 别的 {
+				返回等待 vlessOverWSHandler(请求);
+			}
+		} 捕获（错误）{
+			/** @type {Error} */ let e = err;
+			返回新的响应（e.toString（））；
+		}
+	},
+};
+
+
+
+
+/**
+ *
+ * @param {import("@cloudflare/workers-types").Request} 请求
+ */
+异步函数 vlessOverWSHandler(request) {
+
+	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
+	// @ts-忽略
+	const webSocketPair = new WebSocketPair();
+	const [客户端，webSocket] = Object.values(webSocketPair);
+
+	webSocket.accept();
+
+	让地址=''；
+	让 portWithRandomLog = '';
+	const log = (/** @type {string} */ info, /** @type {string | undefined} */ event) => {
+		console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
+	};
+	const EarlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+
+	const ReadableWebSocketStream = makeReadableWebSocketStream(webSocket, EarlyDataHeader, log);
+
+	/** @type {{ value: import("@cloudflare/workers-types").Socket | 无效的}}*/
+	让remoteSocketWapper = {
+		值：空，
+	};
+	让 udpStreamWrite = null;
+	让 isDns = false;
+
+	// ws --> 远程
+	可读WebSocketStream.pipeTo(new WritableStream({
+		异步写入（块，控制器）{
+			if (isDns && udpStreamWrite) {
+				返回 udpStreamWrite(块);
+			}
+			if (remoteSocketWapper.value) {
+				const writer = remoteSocketWapper.value.writable.getWriter()
+				等待 writer.write(chunk);
+				writer.releaseLock();
+				返回;
+			}
+
+			常量{
+				有错误，
+				信息，
+				远程端口 = 443,
+				地址远程='',
+				原始数据索引，
+				vlessVersion = new Uint8Array([0, 0]),
+				是UDP，
+			} = processVlessHeader(块, userID);
+			地址 = 地址远程；
+			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ？'udp'：'tcp'
+				} `;
+			如果（有错误）{
+				// 控制器. 错误(消息);
+				抛出新的错误（消息）；// cf 似乎有 bug，controller.error 不会结束流
+				// webSocket.close(1000, 消息);
+				返回;
+			}
+			// 如果是 UDP 但端口不是 DNS 端口，则关闭它
+			如果（是UDP）{
+				如果（端口远程=== 53）{
+					isDns = true;
+				} 别的 {
+					//controller.error('UDP代理仅对端口53的DNS启用');
+					throw new Error('UDP 代理仅对端口 53 的 DNS 启用'); // cf 似乎有 bug，controller.error 不会结束流
+					返回;
+				}
+			}
+			// ["version", "附加信息长度N"]
+			const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
+			const rawClientData = chunk.slice(rawDataIndex);
+
+			// TODO: 当 cf 运行时支持 udp 时，在此支持 udp
+			如果（isDns）{
+				const { write } = 等待handleUDPOutBound(webSocket, vlessResponseHeader, log);
+				udpStreamWrite = 写入；
+				udpStreamWrite(rawClientData);
+				返回;
+			}
+			处理TCPOutBound（remoteSocketWapper，addressRemote，portRemote，rawClientData，webSocket，vlessResponseHeader，日志）；
+		},
+		关闭（） {
+			log(`readWebSocketStream 已关闭`);
+		},
+		中止（原因）{
+			log(`readWebSocketStream 已中止`, JSON.stringify(reason));
+		},
+	})).catch((错误) => {
+		日志（'可读WebSocketStream管道错误'，err）;
+	});
+
+	返回新的响应（空，{
+		状态：101，
+		// @ts-忽略
+		webSocket：客户端，
+	});
+}
+
+/**
+ * 处理出站 TCP 连接。
+ *
+ * @param {any} 远程套接字
+ * @param {string} addressRemote 要连接的远程地址。
+ * @param {number} portRemote 要连接的远程端口。
+ * @param {Uint8Array} rawClientData 要写入的原始客户端数据。
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket 将远程套接字传递到的 WebSocket。
+ * @param {Uint8Array} vlessResponseHeader VLESS 响应标头。
+ * @param {function} log 日志记录功能。
+ * @returns {Promise<void>} 远程套接字。
+ */
+异步函数handleTCPOutBound（remoteSocket，addressRemote，portRemote，rawClientData，webSocket，vlessResponseHeader，log，）{
+	异步函数 connectAndWrite(地址, 端口) {
+		/** @type {import("@cloudflare/workers-types").Socket} */
+		const tcpSocket = 连接({
+			主机名：地址，
+			港口： 港口，
+		});
+		RemoteSocket.value = tcpSocket;
+		log(`连接到${地址}:${端口}`);
+		const writer = tcpSocket.writable.getWriter();
+		等待 writer.write(rawClientData); // 首先写入，正常是tls client hello
+		writer.releaseLock();
+		返回 tcpSocket；
+	}
+
+	// 如果 cf connect tcp 套接字没有传入数据，我们重试重定向 ip
+	异步函数重试() {
+		const tcpSocket = 等待 connectAndWrite(proxyIP || 地址远程, 端口远程)
+		// 无论重试成功与否，关闭websocket
+		tcpSocket.close.catch(错误=> {
+			console.log('重试 tcpSocket 关闭错误', error);
+		}).finally(() => {
+			safeCloseWebSocket(webSocket);
+		})
+		RemoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+	}
+
+	const tcpSocket = 等待 connectAndWrite(addressRemote, portRemote);
+
+	// 当remoteSocket准备好时，传递给websocket
+	// 远程--> ws
+	RemoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, 重试, 日志);
+}
+
+/**
+ *
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocketServer
+ * @param {string} EarlyDataHeader for ws 0rtt
+ * @param {(info: string)=> void} ws 0rtt 的日志
+ */
+函数 makeReadableWebSocketStream(webSocketServer, EarlyDataHeader, log) {
+	让 ReadStreamCancel = false;
+	常量流 = 新的 ReadableStream({
+		启动（控制器）{
+			webSocketServer.addEventListener('消息', (事件) => {
+				如果（可读流取消）{
+					返回;
+				}
+				const 消息 = event.data;
+				控制器.enqueue(消息);
+			});
+
+			// 该事件表示客户端关闭了客户端 -> 服务器流。
+			// 但是，服务器 -> 客户端流仍然打开，直到您在服务器端调用 close() 为止。
+			// WebSocket 协议规定必须在每个方向发送单独的关闭消息才能完全关闭套接字。
+			webSocketServer.addEventListener('关闭', () => {
+				// 客户端发送close，需要关闭服务器
+				// 如果流被取消，则跳过controller.close
+				safeCloseWebSocket(webSocketServer);
+				如果（可读流取消）{
+					返回;
+				}
+				控制器.close();
+			}
+			）；
+			webSocketServer.addEventListener('错误', (err) => {
+				log('webSocketServer 有错误');
+				控制器.错误（错误）；
+			}
+			）；
+			// 对于 ws 0rtt
+			const { EarlyData，错误 } = base64ToArrayBuffer(earlyDataHeader);
+			如果（错误）{
+				控制器.错误（错误）；
+			} else if (earlyData) {
+				控制器.enqueue(earlyData);
+			}
+		},
+
+		拉（控制器）{
+			// 如果流已满，ws可以停止读取，我们就可以实现反压
+			// https://streams.spec.whatwg.org/#example-rs-push-backPressure
+		},
+		取消（原因）{
+			// 1.管道WritableStream有错误，这个cancel会被调用，所以ws句柄服务器关闭到这里
+			// 2. 如果 ReadableStream 被取消，则所有的controller.close/enqueue都需要跳过，
+			// 3. 但从测试来看，即使 readableStream 被取消，controller.error 仍然有效
+			如果（可读流取消）{
+				返回;
+			}
+			log(`ReadableStream 被取消，由于 ${reason}`)
+			可读流取消=真；
+			safeCloseWebSocket(webSocketServer);
+		}
+	});
+
+	返回流；
+
+}
+
+// https://xtls.github.io/development/protocols/vless.html
+// https://github.com/zizifn/excalidraw-backup/blob/main/v2ray-protocol.excalidraw
+
+/**
+ *
+ * @param { ArrayBuffer} vlessBuffer
+ * @param {string} 用户ID
+ * @返回
+ */
+函数 processVlessHeader(
+	无缓冲区，
+	用户身份
+）{
+	if (vlessBuffer.byteLength < 24) {
+		返回 {
+			有错误：正确，
+			消息：'无效数据'，
+		};
+	}
+	const 版本 = new Uint8Array(vlessBuffer.slice(0, 1));
+	让 isValidUser = false;
+	让 isUDP = false;
+	if (stringify(new Uint8Array(vlessBuffer.slice(1, 17))) === 用户ID) {
+		有效用户 = true;
+	}
+	如果（！isValidUser）{
+		返回 {
+			有错误：正确，
+			消息：'无效用户'，
+		};
+	}
+
+	const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+	//暂时跳过选择
+
+	const 命令 = new Uint8Array(
+		vlessBuffer.slice(18 + optLength, 18 + optLength + 1)
+	)[0];
+
+	// 0x01 TCP
+	// 0x02 UDP
+	// 0x03 复用器
+	如果（命令=== 1）{
+	} else if (命令 === 2) {
+		isUDP = true;
+	} 别的 {
+		返回 {
+			有错误：正确，
+			消息：`不支持命令 ${command}，命令 01-tcp,02-udp,03-mux`,
+		};
+	}
+	常量端口索引 = 18 + optLength + 1;
+	const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
+	// 端口在原始数据中是大端字节序等 80 == 0x005d
+	const portRemote = new DataView(portBuffer).getUint16(0);
+
+	让地址索引 = 端口索引 + 2;
+	const 地址缓冲区 = 新 Uint8Array(
+		vlessBuffer.slice(地址索引, 地址索引 + 1)
+	）；
+
+	// 1--> ipv4 地址长度 =4
+	// 2-->域名addressLength=addressBuffer[1]
+	// 3--> ipv6 地址长度 =16
+	const 地址类型 = 地址缓冲区[0];
+	让地址长度=0；
+	让地址值索引 = 地址索引 + 1;
+	让地址值 = '';
+	开关（地址类型）{
+		情况1：
+			地址长度=4；
+			地址值 = 新的 Uint8Array(
+				vlessBuffer.slice（地址值索引，地址值索引+地址长度）
+			）。加入（'。'）;
+			休息;
+		案例2：
+			地址长度 = 新的 Uint8Array(
+				vlessBuffer.slice(addressValueIndex, addressValueIndex + 1)
+			)[0];
+			地址值索引 += 1;
+			地址值 = new TextDecoder().decode(
+				vlessBuffer.slice（地址值索引，地址值索引+地址长度）
+			）；
+			休息;
+		案例3：
+			地址长度=16；
+			常量数据视图 = 新数据视图（
+				vlessBuffer.slice（地址值索引，地址值索引+地址长度）
+			）；
+			// 2001:0db8:85a3:0000:0000:8a2e:0370:7334
+			常量 ipv6 = [];
+			for (令 i = 0; i < 8; i++) {
+				ipv6.push(dataView.getUint16(i * 2).toString(16));
+			}
+			地址值 = ipv6.join(':');
+			// ipv6 似乎不需要添加 []
+			休息;
+		默认：
+			返回 {
+				有错误：正确，
+				message: `无效的地址类型是 ${addressType}`,
+			};
+	}
+	如果（！地址值）{
+		返回 {
+			有错误：正确，
+			message: `addressValue 为空，addressType 为 ${addressType}`,
+		};
+	}
+
+	返回 {
+		有错误：假，
+		地址远程：地址值，
+		地址类型，
+		端口远程，
+		rawDataIndex：地址值索引+地址长度，
+		vlessVersion：版本，
+		是UDP，
+	};
+}
+
+
+/**
+ *
+ * @param {import("@cloudflare/workers-types").Socket} RemoteSocket
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket
+ * @param {ArrayBuffer} vlessResponseHeader
+ * @param {(() => 承诺 <void>) | 空} 重试
+ * @param {*} 日志
+ */
+异步函数remoteSocketToWS（remoteSocket，webSocket，vlessResponseHeader，重试，日志）{
+	// 远程--> ws
+	让remoteChunkCount = 0;
+	让块= [];
+	/** @type {ArrayBuffer | 无效的} */
+	让 vlessHeader = vlessResponseHeader;
+	让 hasIncomingData = false; // 检查remoteSocket是否有传入数据
+	等待remoteSocket.read
+		.pipeTo(
+			新的可写流（{
+				开始（） {
+				},
+				/**
+				 *
+				 * @param {Uint8Array} 块
+				 * @param {*} 控制器
+				 */
+				异步写入（块，控制器）{
+					有传入数据 = true;
+					//remoteChunkCount++；
+					if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+						控制器.错误（
+							'webSocket.readyState 未打开，可能已关闭'
+						）；
+					}
+					如果（vlessHeader）{
+						webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
+						vlessHeader = null;
+					} 别的 {
+						// 似乎不需要速率限制，CF 似乎解决了这个问题??..
+						// 如果 (remoteChunkCount > 20000) {
+						// // 比照一个包是4096字节(4kb), 4096 * 20000 = 80M
+						// 等待延迟(1);
+						// }
+						webSocket.send(块);
+					}
+				},
+				关闭（） {
+					log(`remoteConnection!.read 与 hasIncomingData 接近，为 ${hasIncomingData}`);
+					// safeCloseWebSocket(webSocket); // 在某些情况下不需要服务器首先关闭 websocket 会导致 HTTP ERR_CONTENT_LENGTH_MISMATCH 问题，客户端无论如何都会发送关闭事件。
+				},
+				中止（原因）{
+					console.error(`remoteConnection!.read abort`, Reason);
+				},
+			})
+		）
+		.catch((错误) => {
+			控制台.错误（
+				`remoteSocketToWS 有异常`,
+				错误.堆栈 || 错误
+			）；
+			safeCloseWebSocket(webSocket);
+		});
+
+	// 似乎 cf 连接套接字有错误，
+	// 1. Socket.close 会报错
+	// 2. Socket.read 将关闭，没有任何数据到来
+	if (hasIncomingData === false && 重试) {
+		日志（`重试`）
+		重试（）;
+	}
+}
+
+/**
+ *
+ * @param {string} base64Str
+ * @返回
+ */
+函数base64ToArrayBuffer(base64Str) {
+	如果（！base64Str）{
+		返回 { 错误：空 };
+	}
+	尝试 {
+		// 对 URL rfc4648 使用修改后的 Base64，js atob 不支持
+		base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+		const 解码 = atob(base64Str);
+		const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+		return { EarlyData: arryBuffer.buffer, error: null };
+	} 捕获（错误）{
+		返回{错误}；
+	}
+}
+
+/**
+ * 这不是真正的 UUID 验证
+ * @param {string} uuid
+ */
+函数 isValidUUID(uuid) {
+	const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f ]{3}-[0-9a-f]{12}$/i;
+	返回 uuidRegex.test(uuid);
+}
+
+常量 WS_READY_STATE_OPEN = 1;
+常量 WS_READY_STATE_CLOSING = 2;
+/**
+ * 一般情况下，WebSocket关闭时不会出现异常。
+ * @param {import("@cloudflare/workers-types").WebSocket} 套接字
+ */
+函数 safeCloseWebSocket(socket) {
+	尝试 {
+		if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
+			套接字.close();
+		}
+	} 捕获（错误）{
+		console.error('safeCloseWebSocket 错误', error);
+	}
+}
+
+const byteToHex = [];
+for (令 i = 0; i < 256; ++i) {
+	byteToHex.push((i + 256).toString(16).slice(1));
+}
+函数 unsafeStringify(arr, 偏移量 = 0) {
+	return (byteToHex[arr[偏移量 + 0]] + byteToHex[arr[偏移量 + 1]] + byteToHex[arr[偏移量 + 2]] + byteToHex[arr[偏移量 + 3]] + "-" + byteToHex[arr[偏移量 + 4]] + byteToHex[arr[偏移量 + 5]] + "-" + byteToHex[arr[偏移量 + 6]] + byteToHex[arr[偏移量 + 7]] + "-" + byteToHex[arr[偏移量 + 8]] + byteToHex[arr[偏移量 + 9]] + “-” + byteToHex[arr[偏移量 + 10]] + byteToHex[arr[偏移量 + 11]] + byteToHex[arr[偏移量 + 12]] + byteToHex[ arr[偏移量 + 13]] + byteToHex[arr[偏移量 + 14]] + byteToHex[arr[偏移量 + 15]]).toLowerCase();
+}
+函数 stringify(arr, 偏移量 = 0) {
+	const uuid = unsafeStringify(arr, 偏移量);
+	if (!isValidUUID(uuid)) {
+		throw TypeError("字符串化 UUID 无效");
+	}
+	返回uuid；
+}
+
+
+/**
+ *
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket
+ * @param {ArrayBuffer} vlessResponseHeader
+ * @param {(string)=> void} 日志
+ */
+异步函数handleUDPOutBound(webSocket, vlessResponseHeader, log) {
+
+	让 isVlessHeaderSent = false;
+	常量 TransformStream = 新 TransformStream({
+		启动（控制器）{
+
+		},
+		变换（块，控制器）{
+			// udp消息2字节是udp数据的长度
+			// TODO: 这应该有 bug，因为也许 udp 块可以在两个 websocket 消息中
+			for (让索引 = 0; 索引 < chunk.byteLength;) {
+				const lengthBuffer = chunk.slice(索引, 索引 + 2);
+				const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
+				const udpData = 新 Uint8Array(
+					chunk.slice(索引 + 2, 索引 + 2 + udpPakcetLength)
+				）；
+				索引 = 索引 + 2 + udpPakcetLength；
+				控制器.enqueue(udpData);
+			}
+		},
+		冲洗（控制器）{
+		}
+	});
+
+	// 现在只处理 dns udp
+	transformStream.read.pipeTo(new WritableStream({
+		异步写入（块）{
+			const resp = 等待 fetch('https://1.1.1.1/dns-query',
+				{
+					方法：'POST'，
+					标题：{
+						'内容类型'：'应用程序/dns消息'，
+					},
+					主体：块，
+				})
+			const dnsQueryResult = 等待 resp.arrayBuffer();
+			const udpSize = dnsQueryResult.byteLength;
+			// console.log([...new Uint8Array(dnsQueryResult)].map((x) => x.toString(16)));
+			const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+			if (webSocket.readyState === WS_READY_STATE_OPEN) {
+				log(`doh 成功且 dns 消息长度为 ${udpSize}`);
+				如果（isVlessHeaderSent）{
+					webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+				} 别的 {
+					webSocket.send(等待新的 Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+					isVlessHeaderSent = true;
+				}
+			}
+		}
+	})).catch((错误) => {
+		log('dns udp 有错误' + 错误)
+	});
+
+	const writer =transformStream.writable.getWriter();
+
+	返回 {
+		/**
+		 *
+		 * @param {Uint8Array} 块
+		 */
+		写（块）{
+			writer.write(块);
+		}
+	};
+}
+
+/**
+ *
+ * @param {string} 用户ID
+ * @param {字符串| null} 主机名
+ * @returns {字符串}
+ */
+函数 getVLESSConfig(用户 ID, 主机名) {
+	const vlessMain = `vless://${userID}@${hostName}:443?加密=none&security=tls&sni=${hostName}&fp=randomized&type=ws&host=${hostName}&path=%2F%3Fed%3D2048#$ {主机名}`
+	返回`
+#################################################### ##############
+v2ray
+-------------------------------------------------- -------------
+${vlessMain}
+-------------------------------------------------- -------------
+#################################################### ##############
+冲突元
+-------------------------------------------------- -------------
+- 类型：vless
+  名称：${主机名}
+  服务器：${主机名}
+  端口：443
+  uuid：${用户ID}
+  网络：ws
+  tls: 正确
+  UDP：假
+  sni: ${主机名}
+  客户端指纹：镀铬
+  ws-选项：
+    路径：“/?ed=2048”
+    标题：
+      主机：${主机名}
+-------------------------------------------------- -------------
+#################################################### ##############
+`;
+}
